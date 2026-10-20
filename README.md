@@ -24,6 +24,8 @@ which validates it and stores it in DynamoDB. Infrastructure is defined with AWS
 | `bin/gps-tracker.ts` | CDK app entry point |
 | `lib/gps-tracker-stack.ts` | The stack: tables, IoT policy and rule, Lambda, DLQ |
 | `lib/go-function.ts` | Construct that builds a Go Lambda from `lambda/cmd/<name>` |
+| `lib/github-oidc-stack.ts` | IAM role GitHub Actions deploys with (deployed by hand, once) |
+| `.github/workflows/ci.yml` | Tests on every PR and push, deploys `main` |
 | `lambda/` | Go module with all Lambda code |
 | `lambda/internal/protocol` | Wire protocol v1: types and validation (unit tested) |
 | `lambda/cmd/ingest` | The ingest Lambda |
@@ -40,6 +42,30 @@ npm test               # Go unit tests
 npx cdk bootstrap      # once per account/region
 npx cdk deploy
 ```
+
+Everything deploys to `ap-southeast-2`. The region is fixed in `bin/gps-tracker.ts` and `scripts/provision-device.sh`.
+
+### Continuous deployment (GitHub Actions)
+
+`.github/workflows/ci.yml` runs on every PR and push: type-check, Go tests and vet, then `cdk synth`.
+On `main` it then deploys the `GpsTracker` stack. CI authenticates with **OIDC**: GitHub issues a short-lived
+token that AWS exchanges for the `GpsTrackerGithubDeploy` role, so no AWS keys are stored in GitHub.
+That role can only assume the CDK bootstrap roles. It trusts only jobs from this repository running in the GitHub
+environment `production`.
+
+One-time setup:
+
+1. Deploy the OIDC stack from your machine. CI never deploys this stack, so it can't change its own access:
+   ```sh
+   npx cdk bootstrap
+   npx cdk deploy GpsTrackerGithubOidc   # prints DeployRoleArn
+   ```
+   If the account already has a GitHub OIDC provider (from another project), the deploy fails. In that case,
+   import the existing provider in `lib/github-oidc-stack.ts` instead of creating a new one.
+2. In GitHub, open **Settings → Environments → New environment** and create `production`.
+   Under *Deployment branches*, allow only `main`. Optionally, add yourself as a required reviewer so each deploy waits for your approval.
+3. In **Settings → Secrets and variables → Actions → Variables**, add `AWS_DEPLOY_ROLE_ARN` = the `DeployRoleArn` output.
+   It's a variable, not a secret: the ARN isn't sensitive.
 
 Register a tracker (after the stack is deployed — it owns the device policy):
 
