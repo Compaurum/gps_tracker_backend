@@ -63,17 +63,6 @@ jobs:
         run: |
           echo "::error::Variable AWS_DEPLOY_ROLE_ARN is not set. Add it under Settings → Secrets and variables → Actions → Variables (or as a variable of the 'production' environment), using the DeployRoleArn output of the GpsTrackerGithubOidc stack."
           exit 1
-      # TEMPORARY: prints the OIDC claims AWS checks against the role's trust policy. Remove once deploys work.
-      - name: Debug OIDC claims
-        env:
-          ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-        run: |
-          printf 'role-to-assume: [%s] (%d chars)\n' "$ROLE_ARN" "${#ROLE_ARN}"
-          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
-          payload=$(cut -d. -f2 <<<"$token" | tr '_-' '/+')
-          while (( ${#payload} % 4 )); do payload+='='; done
-          base64 -d <<<"$payload" | jq '{sub, aud, iss, repository, environment, ref}'
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}

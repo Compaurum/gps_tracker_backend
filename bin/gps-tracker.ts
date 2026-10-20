@@ -14,6 +14,6 @@ new GpsTrackerStack(app, 'GpsTracker', { env });
 
 new GithubOidcStack(app, 'GpsTrackerGithubOidc', {
   env,
-  repo: 'Compaurum/gps_tracker_backend',
+  repo: { owner: 'Compaurum', ownerId: 13798119, name: 'gps_tracker_backend', id: 1426766580 },
   environment: 'production',
 });
