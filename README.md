@@ -1,1 +1,226 @@
 # gps_tracker_backend
+
+AWS backend for the GPS tracker (firmware: `../gps_tracker`, a LilyGO T-Call A7670 — ESP32 + LTE Cat-1 modem).
+Trackers publish positions over MQTT to AWS IoT Core; an IoT rule hands each message to a Go Lambda,
+which validates it and stores it in DynamoDB. Infrastructure is defined with AWS CDK (TypeScript).
+
+```
+ tracker (A7670 built-in MQTT client)
+     │  MQTT 3.1.1 over TLS 1.2, port 8883, X.509 client cert
+     ▼
+ AWS IoT Core ── policy: each thing may only use trackers/<its-name>/...
+     │  topic rule: SELECT *, topic(2) AS deviceId, topic(3) AS msgType, timestamp() AS receivedAt
+     │              FROM 'trackers/+/+' WHERE msgType is telemetry|status
+     ▼
+ Lambda "ingest" (Go, arm64) ──validate──▶ DynamoDB  Positions (history, TTL)
+     │                                    DynamoDB  Devices   (latest state)
+     └── failures (after 2 retries) / rule errors ──▶ SQS IngestDlq (14 days)
+```
+
+## Repository layout
+
+| Path | What |
+|---|---|
+| `bin/gps-tracker.ts` | CDK app entry point |
+| `lib/gps-tracker-stack.ts` | The stack: tables, IoT policy and rule, Lambda, DLQ |
+| `lib/go-function.ts` | Construct that builds a Go Lambda from `lambda/cmd/<name>` |
+| `lambda/` | Go module with all Lambda code |
+| `lambda/internal/protocol` | Wire protocol v1: types and validation (unit tested) |
+| `lambda/cmd/ingest` | The ingest Lambda |
+| `scripts/provision-device.sh` | Registers a tracker and downloads its certificate |
+
+## Usage
+
+Prerequisites: Node.js, Go 1.26 (or Docker — used to build the Lambda when Go isn't installed), AWS CLI with credentials.
+
+```sh
+npm install
+npm run build          # type-check the CDK app (TypeScript 7)
+npm test               # Go unit tests
+npx cdk bootstrap      # once per account/region
+npx cdk deploy
+```
+
+Register a tracker (after the stack is deployed — it owns the device policy):
+
+```sh
+scripts/provision-device.sh tracker-01
+```
+
+This creates the IoT thing, an active certificate with the device policy attached, and writes
+`certs/tracker-01/{device.pem.crt,private.pem.key,AmazonRootCA1.pem}` (git-ignored). It prints the
+account's ATS endpoint. The private key exists only in that directory — keep it safe.
+
+Simulate a tracker without hardware (your IAM credentials bypass the device policy):
+
+```sh
+aws iot-data publish --topic trackers/tracker-01/telemetry --cli-binary-format raw-in-base64-out \
+  --payload "{\"v\":1,\"seq\":1,\"fixes\":[{\"t\":$(date +%s),\"lat\":-32.9283,\"lon\":151.7817,\"sat\":8}]}"
+```
+
+## Decisions
+
+### 1. AWS IoT Core as the device entry point
+
+Chosen over API Gateway (HTTPS) and a self-hosted MQTT broker.
+
+- **Mutual TLS with per-device X.509 certificates** gives each tracker its own identity, and a stolen device can be revoked on its own. No shared API keys in firmware.
+- **Persistent MQTT connection**: after the TLS handshake (the expensive part on a Cat-1 modem), each message costs only a few bytes of protocol overhead, and the server can push commands down to the device.
+- **Serverless**: nothing to patch or scale; at hobby volume it costs cents a month.
+- **Trade-off**: AWS lock-in, and certificate handling on the device is more work than an HTTP API key.
+
+### 2. MQTT over TLS using the modem's built-in stack
+
+The SIMCom A7670 has its own MQTT(S) client (`AT+CMQTT*`, with TLS via `AT+CSSLCFG`), so the
+ESP32 doesn't need to run TLS or an MQTT library itself. Certificates are uploaded to the modem's
+filesystem once (`AT+CCERTDOWN`). LilyGO's `LilyGo-Modem-Series` repository has MQTTS examples for this modem.
+
+- MQTT 3.1.1, port 8883, TLS 1.2, server verified against Amazon Root CA 1.
+- **Client ID must equal the thing name**: the IoT policy refuses any other.
+- Keep-alive 60–300 s. Use QoS 1 for telemetry and status (QoS 2 is not supported by IoT Core).
+- Rejected: MQTT over WebSockets on 443 (more overhead, SigV4 signing on the device) and HTTPS
+  (a TLS handshake per request costs far more data and power than one long-lived connection).
+
+### 3. JSON payloads with short keys
+
+Chosen over binary formats (Protobuf, CBOR, packed structs).
+
+- IoT Core rules and CloudWatch logs read JSON directly, and it's easy to debug from a serial console or `aws iot-data publish`.
+- Short keys plus **batching** several fixes per message keep payloads small. A 10-fix batch with every optional field is about 1.1 KB, well under IoT Core's 5 KB billing increment, so it's billed as a single message.
+- If cellular data cost ever matters, a binary encoding can come in as protocol `v: 2` on the same topics.
+
+### 4. IoT rule → Lambda → DynamoDB
+
+Chosen over the rule's built-in DynamoDBv2 action.
+
+- The direct action writes one item per message and can't split a batch of fixes, validate input, or keep a
+  "latest position" that only moves forward. A small Lambda does all three.
+- **Invalid payloads are logged and dropped**, because retrying them can't succeed. Infrastructure errors are returned, so Lambda retries
+  (2×) and then sends the event to the **SQS DLQ**. The rule's error action sends to the same queue when IoT Core
+  can't invoke the Lambda at all.
+
+### 5. Go for Lambdas, TypeScript for CDK
+
+- **Go Lambdas**: static binary on `provided.al2023`, arm64 (Graviton is cheaper), roughly 10–20 ms cold start, runs fine in 128 MB.
+  All handlers live in one Go module under `lambda/`, one `cmd/<name>` package per function, sharing `internal/` code.
+  `lib/go-function.ts` builds them during `cdk synth` with `go build`, or in a `golang` Docker image when Go isn't installed.
+- **TypeScript CDK**: CDK's native language, with the most examples and the newest constructs first. It runs through `tsx`
+  (esbuild), so it doesn't depend on the TypeScript compiler API, and `tsc` (TypeScript 7) is used only for type-checking.
+
+### 6. DynamoDB data model
+
+Two on-demand tables (no capacity planning; idle cost is storage only). Point-in-time recovery is on and removal policy is RETAIN.
+
+**Positions**: one item per fix.
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `deviceId` | S, partition key | thing name |
+| `ts` | N, sort key | fix time, UTC epoch **seconds** (from GPS) |
+| `lat`, `lon` | N | WGS84 decimal degrees |
+| `alt`, `spd`, `crs`, `sat`, `hdop` | N | optional, see protocol |
+| `seq` | N | message sequence number, for spotting gaps |
+| `receivedAt` | N | epoch ms when IoT Core received the message |
+| `expiresAt` | N | TTL: `ts` + retention (default 365 days) |
+
+- "Track for device X between A and B" is a single `Query` on `deviceId = X AND ts BETWEEN A AND B`.
+- **Idempotent**: QoS 1 redeliveries and re-sent backlogs overwrite the same `(deviceId, ts)` item.
+
+**Devices**: one item per tracker (`deviceId` partition key) with `lastSeenAt`, `lastFix`, `lastFixTs`,
+`bat`, `rssi`, `fw`, `uptime`, `lastEvent`, `lastEventAt`. `lastFix` is updated with a condition
+`lastFixTs < :new`, so a late-arriving backlog never moves the "current position" backwards.
+
+### 7. Device provisioning by script, not CDK
+
+CDK owns the shared device policy. Things and certificates are created by `scripts/provision-device.sh`
+because the private key must reach the device and must not end up in CloudFormation state.
+Fleet provisioning (claim certificates) can replace this if there are ever many devices.
+
+## Device protocol (v1)
+
+### Topics
+
+`<id>` is the IoT thing name (`[a-zA-Z0-9_-]{1,64}`), which is also the MQTT client ID.
+
+| Topic | Direction | QoS | Purpose |
+|---|---|---|---|
+| `trackers/<id>/telemetry` | device → cloud | 1 | GPS fixes (batched) |
+| `trackers/<id>/status` | device → cloud | 1 | Lifecycle and health events |
+| `trackers/<id>/cmd` | cloud → device | 1 | Commands. **Reserved**: the device may subscribe; nothing publishes yet |
+
+The IoT policy only allows each device to publish to, and subscribe on, its own three topics.
+The backend takes `deviceId` from the topic, so it's never part of the payload.
+
+### Common rules
+
+- UTF-8 JSON object; every message has `"v": 1`. Messages with another version are rejected.
+- Unknown fields are ignored, so new optional fields can be added to v1 without breaking older backends.
+  A breaking change means a new `v`.
+- Time is UTC epoch **seconds** taken from GPS, so the device needs no NTP. IoT Core adds its own receive timestamp.
+- Optional fields are left out rather than sent as `null`.
+
+### `telemetry`
+
+```json
+{
+  "v": 1,
+  "seq": 1042,
+  "fixes": [
+    {"t": 1760949990, "lat": -32.928312, "lon": 151.781705, "alt": 12.3, "spd": 4.2, "crs": 270.0, "sat": 9, "hdop": 0.9},
+    {"t": 1760950000, "lat": -32.928401, "lon": 151.781822}
+  ],
+  "bat": 3.98,
+  "rssi": -71
+}
+```
+
+| Field | Req | Type | Meaning |
+|---|---|---|---|
+| `seq` | no | int | Message counter, increments per publish, wraps / resets on boot |
+| `fixes` | yes | array, 1–100 | Oldest first |
+| `fixes[].t` | yes | int | Fix time, UTC epoch seconds |
+| `fixes[].lat`, `lon` | yes | number | WGS84 decimal degrees, 6 decimals (~0.1 m) is plenty |
+| `fixes[].alt` | no | number | Metres above mean sea level |
+| `fixes[].spd` | no | number | Ground speed, km/h |
+| `fixes[].crs` | no | number | Course over ground, degrees 0–360 |
+| `fixes[].sat` | no | int | Satellites used in the fix |
+| `fixes[].hdop` | no | number | Horizontal dilution of precision |
+| `bat` | no | number | Battery voltage, volts |
+| `rssi` | no | number | Cellular signal, dBm |
+
+The backend drops individual fixes that are implausible:
+- `t` before 2020 or more than 5 minutes in the future
+- latitude or longitude out of range
+- exactly `0,0` (what many receivers report before they have a fix)
+- wrong types
+
+The rest of the message is still stored.
+
+### `status`
+
+```json
+{"v": 1, "ev": "boot", "fw": "0.1.0", "bat": 4.12, "rssi": -69, "up": 4}
+```
+
+| Field | Req | Type | Meaning |
+|---|---|---|---|
+| `ev` | yes | string | `boot`, `heartbeat`, `low_battery`, `shutdown` |
+| `fw` | no | string | Firmware version |
+| `bat`, `rssi` | no | number | As in telemetry |
+| `up` | no | int | Seconds since boot |
+
+### `cmd` (reserved)
+
+Planned shape, so the firmware can subscribe early and ignore what it doesn't understand:
+
+```json
+{"v": 1, "id": "c0ffee01", "cmd": "set_interval", "args": {"sample_s": 10, "publish_s": 60}}
+```
+
+### Recommended device behaviour
+
+- Sample GPS every 10 s while moving and publish a batch every 60 s. While stationary, send a `heartbeat` status every 15 minutes instead of telemetry.
+- Publish a `boot` status as soon as the connection comes up.
+- **Store-and-forward**: buffer unsent fixes in RAM/PSRAM while offline, then send the backlog oldest first, up to 100 fixes per
+  message, after reconnecting. Resending is safe: storage is keyed on `(deviceId, t)`.
+- Treat a message as delivered only after its PUBACK.

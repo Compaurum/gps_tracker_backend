@@ -1,0 +1,5 @@
+node_modules/
+cdk.out/
+.cdk.staging/
+# Device private keys and certificates produced by scripts/provision-device.sh
+certs/
