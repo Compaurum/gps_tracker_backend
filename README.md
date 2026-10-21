@@ -1,11 +1,14 @@
 # gps_tracker_backend
 
-AWS backend for the GPS tracker (firmware: `../gps_tracker`, a LilyGO T-Call A7670 — ESP32 + LTE Cat-1 modem).
+AWS backend for GPS trackers. It isn't tied to one kind of hardware: any device that speaks the [device protocol](#device-protocol-v1)
+over MQTT/TLS can report to it, and each device reports its hardware model (`hw`) so the backend knows what it is.
+The first device is a LilyGO T-Call A7670 (ESP32 + LTE Cat-1 modem; firmware in `../gps_tracker`).
+
 Trackers publish positions over MQTT to AWS IoT Core; an IoT rule hands each message to a Go Lambda,
 which validates it and stores it in DynamoDB. Infrastructure is defined with AWS CDK (TypeScript).
 
 ```
- tracker (A7670 built-in MQTT client)
+ tracker (any hardware with an MQTT/TLS client)
      │  MQTT 3.1.1 over TLS 1.2, port 8883, X.509 client cert
      ▼
  AWS IoT Core ── policy: each thing may only use trackers/<its-name>/...
@@ -92,21 +95,24 @@ aws iot-data publish --topic trackers/tracker-01/telemetry --cli-binary-format r
 Chosen over API Gateway (HTTPS) and a self-hosted MQTT broker.
 
 - **Mutual TLS with per-device X.509 certificates** gives each tracker its own identity, and a stolen device can be revoked on its own. No shared API keys in firmware.
-- **Persistent MQTT connection**: after the TLS handshake (the expensive part on a Cat-1 modem), each message costs only a few bytes of protocol overhead, and the server can push commands down to the device.
+- **Persistent MQTT connection**: after the TLS handshake (the expensive part on a cellular modem), each message costs only a few bytes of protocol overhead, and the server can push commands down to the device.
 - **Serverless**: nothing to patch or scale; at hobby volume it costs cents a month.
 - **Trade-off**: AWS lock-in, and certificate handling on the device is more work than an HTTP API key.
 
-### 2. MQTT over TLS using the modem's built-in stack
+### 2. MQTT over TLS, from any hardware
 
-The SIMCom A7670 has its own MQTT(S) client (`AT+CMQTT*`, with TLS via `AT+CSSLCFG`), so the
-ESP32 doesn't need to run TLS or an MQTT library itself. Certificates are uploaded to the modem's
-filesystem once (`AT+CCERTDOWN`). LilyGO's `LilyGo-Modem-Series` repository has MQTTS examples for this modem.
+The backend only cares about the protocol, not the device. A device needs:
 
-- MQTT 3.1.1, port 8883, TLS 1.2, server verified against Amazon Root CA 1.
+- MQTT 3.1.1, port 8883, TLS 1.2 with its X.509 client certificate, server verified against Amazon Root CA 1.
 - **Client ID must equal the thing name**: the IoT policy refuses any other.
 - Keep-alive 60–300 s. Use QoS 1 for telemetry and status (QoS 2 is not supported by IoT Core).
 - Rejected: MQTT over WebSockets on 443 (more overhead, SigV4 signing on the device) and HTTPS
   (a TLS handshake per request costs far more data and power than one long-lived connection).
+
+Example, LilyGO T-Call A7670: the SIMCom A7670 modem has its own MQTT(S) client (`AT+CMQTT*`, with TLS via
+`AT+CSSLCFG`), so the ESP32 doesn't need to run TLS or an MQTT library itself. Certificates are uploaded to the
+modem's filesystem once (`AT+CCERTDOWN`). LilyGO's `LilyGo-Modem-Series` repository has MQTTS examples for it.
+A device with Wi-Fi or a different modem would use its own MQTT/TLS client instead.
 
 ### 3. JSON payloads with short keys
 
@@ -165,7 +171,7 @@ written only if `version < :new`:
 |---|---|---|---|
 | Connectivity | — | `lastSeenAt` | IoT Core receive time |
 | Health | `batV`, `rssi` | `healthAt` | device time (only messages that carry them) |
-| Event | `lastEvent`, `fw`, `uptime` | `lastEventAt` | device time |
+| Event | `lastEvent`, `fw`, `hw`, `uptime` | `lastEventAt` | device time |
 | Position | `lastFix` | `lastFixTs` | fix time, so a late backlog never moves the position backwards |
 
 Separate groups keep a message that's stale for one group (e.g. battery) from being dropped for another it's newest
@@ -181,7 +187,7 @@ this table keeps every one, for battery curves and past events.
 | `receivedAt` | N, sort key | when IoT Core received the message (unique per device, unlike device time) |
 | `ts` | N | device time the message was created |
 | `type` | S | `status` (every status message) or `telemetry` (telemetry messages that report `batV`/`rssi`) |
-| `event`, `fw`, `uptime` | S / S / N | status messages only |
+| `event`, `fw`, `hw`, `uptime` | S / S / S / N | status messages only |
 | `batV`, `rssi` | N | when reported |
 | `seq` | N | telemetry only |
 
@@ -214,8 +220,8 @@ The backend takes `deviceId` from the topic, so it's never part of the payload.
 - UTF-8 JSON object. Every message has `"v": 1` and `ts`; a message missing either is rejected.
 - Unknown fields are ignored, so new optional fields can be added to v1 without breaking older backends.
   A breaking change means a new `v`.
-- **Timestamps are UTC epoch milliseconds.** `ts` is the device's clock: GPS time, or network time from the
-  modem (`AT+CCLK`) before the first fix. A timestamp before 2020 or more than 5 minutes in the future is treated as
+- **Timestamps are UTC epoch milliseconds.** `ts` is the device's clock: GPS time, or network/NTP time before
+  the first fix (on the A7670, the modem's clock via `AT+CCLK`). A timestamp before 2020 or more than 5 minutes in the future is treated as
   "clock not set". IoT Core adds its own `receivedAt`.
 - Optional fields are left out rather than sent as `null`.
 
@@ -261,7 +267,7 @@ The rest of the message is still stored.
 ### `status`
 
 ```json
-{"v": 1, "ts": 1760950001000, "event": "boot", "fw": "0.1.0", "batV": 4.12, "rssi": -69, "uptime": 4}
+{"v": 1, "ts": 1760950001000, "event": "boot", "fw": "0.1.0", "hw": "lilygo-t-call-a7670", "batV": 4.12, "rssi": -69, "uptime": 4}
 ```
 
 | Field | Req | Type | Meaning |
@@ -269,6 +275,7 @@ The rest of the message is still stored.
 | `ts` | yes | int | When the event happened |
 | `event` | yes | string | `boot`, `heartbeat`, `low_battery`, `shutdown` |
 | `fw` | no | string | Firmware version |
+| `hw` | no | string | Hardware model, e.g. `lilygo-t-call-a7670`. Lowercase, dash-separated, stable per device type. Send it on `boot` |
 | `batV`, `rssi` | no | number | As in telemetry |
 | `uptime` | no | int | Seconds since boot |
 
@@ -283,7 +290,7 @@ Planned shape, so the firmware can subscribe early and ignore what it doesn't un
 ### Recommended device behaviour
 
 - Sample GPS every 10 s while moving and publish a batch every 60 s. While stationary, send a `heartbeat` status every 15 minutes instead of telemetry.
-- Publish a `boot` status as soon as the connection comes up.
+- Publish a `boot` status, with `fw` and `hw`, as soon as the connection comes up.
 - **Store-and-forward**: buffer unsent fixes in RAM/PSRAM while offline, then send the backlog oldest first, up to 100 fixes per
   message, after reconnecting. Resending is safe: storage is keyed on `(deviceId, ts)`.
 - Treat a message as delivered only after its PUBACK.

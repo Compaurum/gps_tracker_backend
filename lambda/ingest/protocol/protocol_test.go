@@ -76,11 +76,11 @@ func TestParseTelemetryRejects(t *testing.T) {
 }
 
 func TestParseStatus(t *testing.T) {
-	s, err := ParseStatus([]byte(`{"v":1,"ts":1760949995000,"event":"boot","fw":"0.1.0","batV":4.1,"uptime":3}`), now)
+	s, err := ParseStatus([]byte(`{"v":1,"ts":1760949995000,"event":"boot","fw":"0.1.0","hw":"lilygo-t-call-a7670","batV":4.1,"uptime":3}`), now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.Timestamp != 1760949995000 || s.Event != EventBoot || *s.FirmwareVersion != "0.1.0" || *s.BatteryVoltage != 4.1 || *s.Uptime != 3 {
+	if s.Timestamp != 1760949995000 || s.Event != EventBoot || *s.FirmwareVersion != "0.1.0" || *s.HardwareModel != "lilygo-t-call-a7670" || *s.BatteryVoltage != 4.1 || *s.Uptime != 3 {
 		t.Fatalf("unexpected status: %+v", s)
 	}
 

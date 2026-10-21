@@ -45,6 +45,7 @@ type historyItem struct {
 	Type            string               `dynamodbav:"type"`       // "status" or "telemetry"
 	Event           protocol.StatusEvent `dynamodbav:"event,omitempty"`
 	FirmwareVersion *string              `dynamodbav:"fw,omitempty"`
+	HardwareModel   *string              `dynamodbav:"hw,omitempty"`
 	Uptime          *int64               `dynamodbav:"uptime,omitempty"`
 	BatteryVoltage  *float64             `dynamodbav:"batV,omitempty"`
 	Rssi            *float64             `dynamodbav:"rssi,omitempty"`
@@ -161,7 +162,7 @@ func (in *ingester) saveTelemetry(ctx context.Context, m meta, msg protocol.Tele
 func (in *ingester) saveStatus(ctx context.Context, m meta, msg protocol.Status) error {
 	err := in.putHistory(ctx, historyItem{
 		DeviceID: m.DeviceID, ReceivedAt: m.ReceivedAt, Timestamp: msg.Timestamp, Type: "status",
-		Event: msg.Event, FirmwareVersion: msg.FirmwareVersion, Uptime: msg.Uptime,
+		Event: msg.Event, FirmwareVersion: msg.FirmwareVersion, HardwareModel: msg.HardwareModel, Uptime: msg.Uptime,
 		BatteryVoltage: msg.BatteryVoltage, Rssi: msg.Rssi,
 	})
 	if err != nil {
@@ -175,6 +176,7 @@ func (in *ingester) saveStatus(ctx context.Context, m meta, msg protocol.Status)
 	}
 	u := expression.Set(expression.Name("lastEvent"), expression.Value(msg.Event))
 	u = setIfPresent(u, "fw", msg.FirmwareVersion)
+	u = setIfPresent(u, "hw", msg.HardwareModel)
 	u = setIfPresent(u, "uptime", msg.Uptime)
 	return in.updateDeviceIfNewer(ctx, m.DeviceID, "lastEventAt", msg.Timestamp, u)
 }

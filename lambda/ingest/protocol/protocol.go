@@ -57,6 +57,7 @@ type Status struct {
 	Timestamp       int64       `json:"ts"` // device time of the event, UTC epoch ms
 	Event           StatusEvent `json:"event"`
 	FirmwareVersion *string     `json:"fw"`
+	HardwareModel   *string     `json:"hw"`     // device type, e.g. "lilygo-t-call-a7670"; sent on boot
 	BatteryVoltage  *float64    `json:"batV"`   // volts
 	Rssi            *float64    `json:"rssi"`   // cellular signal strength, dBm
 	Uptime          *int64      `json:"uptime"` // seconds since boot
