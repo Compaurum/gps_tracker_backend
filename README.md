@@ -12,8 +12,9 @@ which validates it and stores it in DynamoDB. Infrastructure is defined with AWS
      │  topic rule: SELECT *, topic(2) AS deviceId, topic(3) AS msgType, timestamp() AS receivedAt
      │              FROM 'trackers/+/+' WHERE msgType is telemetry|status
      ▼
- Lambda "ingest" (Go, arm64) ──validate──▶ DynamoDB  Positions (history, TTL)
+ Lambda "ingest" (Go, arm64) ──validate──▶ DynamoDB  Positions (history)
      │                                    DynamoDB  Devices   (latest state)
+     │                                    DynamoDB  DeviceHistory (status & battery timeline)
      └── failures (after 2 retries) / rule errors ──▶ SQS IngestDlq (14 days)
 ```
 
@@ -23,12 +24,12 @@ which validates it and stores it in DynamoDB. Infrastructure is defined with AWS
 |---|---|
 | `bin/gps-tracker.ts` | CDK app entry point |
 | `lib/gps-tracker-stack.ts` | The stack: tables, IoT policy and rule, Lambda, DLQ |
-| `lib/go-function.ts` | Construct that builds a Go Lambda from `lambda/cmd/<name>` |
+| `lib/go-function.ts` | Construct that builds a Go Lambda from `lambda/<name>` |
 | `lib/github-oidc-stack.ts` | IAM role GitHub Actions deploys with (deployed by hand, once) |
 | `.github/workflows/ci.yml` | Tests on every PR and push, deploys `main` |
 | `lambda/` | Go module with all Lambda code |
-| `lambda/internal/protocol` | Wire protocol v1: types and validation (unit tested) |
-| `lambda/cmd/ingest` | The ingest Lambda |
+| `lambda/ingest` | The ingest Lambda (`main` package) |
+| `lambda/ingest/protocol` | Wire protocol v1: types and validation (unit tested) |
 | `scripts/provision-device.sh` | Registers a tracker and downloads its certificate |
 
 ## Usage
@@ -81,7 +82,7 @@ Simulate a tracker without hardware (your IAM credentials bypass the device poli
 
 ```sh
 aws iot-data publish --topic trackers/tracker-01/telemetry --cli-binary-format raw-in-base64-out \
-  --payload "{\"v\":1,\"seq\":1,\"fixes\":[{\"t\":$(date +%s),\"lat\":-32.9283,\"lon\":151.7817,\"sat\":8}]}"
+  --payload "{\"v\":1,\"ts\":$(date +%s)000,\"seq\":1,\"fixes\":[{\"ts\":$(date +%s)000,\"lat\":-32.9283,\"lon\":151.7817,\"sat\":8}]}"
 ```
 
 ## Decisions
@@ -112,7 +113,8 @@ filesystem once (`AT+CCERTDOWN`). LilyGO's `LilyGo-Modem-Series` repository has 
 Chosen over binary formats (Protobuf, CBOR, packed structs).
 
 - IoT Core rules and CloudWatch logs read JSON directly, and it's easy to debug from a serial console or `aws iot-data publish`.
-- Short keys plus **batching** several fixes per message keep payloads small. A 10-fix batch with every optional field is about 1.1 KB, well under IoT Core's 5 KB billing increment, so it's billed as a single message.
+- Short keys (`v`, `seq`, `ts`, `alt`, `spd`, `crs`, `sat`, `batV`, `fw`) plus **batching** several fixes per message keep payloads small.
+  The same names are used in DynamoDB. A 10-fix batch with every optional field is about 1.2 KB, under IoT Core's 5 KB billing increment, so it's billed as one message.
 - If cellular data cost ever matters, a binary encoding can come in as protocol `v: 2` on the same topics.
 
 ### 4. IoT rule → Lambda → DynamoDB
@@ -128,33 +130,63 @@ Chosen over the rule's built-in DynamoDBv2 action.
 ### 5. Go for Lambdas, TypeScript for CDK
 
 - **Go Lambdas**: static binary on `provided.al2023`, arm64 (Graviton is cheaper), roughly 10–20 ms cold start, runs fine in 128 MB.
-  All handlers live in one Go module under `lambda/`, one `cmd/<name>` package per function, sharing `internal/` code.
+  All handlers live in one Go module under `lambda/`, one folder per function (`lambda/<name>/`, holding its `main` package and its own sub-packages). Code needed by more than one function goes in `lambda/internal/`.
   `lib/go-function.ts` builds them during `cdk synth` with `go build`, or in a `golang` Docker image when Go isn't installed.
 - **TypeScript CDK**: CDK's native language, with the most examples and the newest constructs first. It runs through `tsx`
   (esbuild), so it doesn't depend on the TypeScript compiler API, and `tsc` (TypeScript 7) is used only for type-checking.
 
 ### 6. DynamoDB data model
 
-Two on-demand tables (no capacity planning; idle cost is storage only). Point-in-time recovery is on and removal policy is RETAIN.
+Three on-demand tables (no capacity planning; idle cost is storage only). Point-in-time recovery is on and removal policy is RETAIN.
 
-**Positions**: one item per fix.
+All timestamps are UTC epoch **milliseconds**. `ts` is the device's time (when something happened);
+`receivedAt` is IoT Core's time (when the message arrived).
+
+**Positions**: one item per fix, kept forever (no TTL).
 
 | Attribute | Type | Notes |
 |---|---|---|
 | `deviceId` | S, partition key | thing name |
-| `ts` | N, sort key | fix time, UTC epoch **seconds** (from GPS) |
+| `ts` | N, sort key | fix time (from the device) |
 | `lat`, `lon` | N | WGS84 decimal degrees |
 | `alt`, `spd`, `crs`, `sat`, `hdop` | N | optional, see protocol |
-| `seq` | N | message sequence number, for spotting gaps |
-| `receivedAt` | N | epoch ms when IoT Core received the message |
-| `expiresAt` | N | TTL: `ts` + retention (default 365 days) |
+| `seq` | N | sequence number of the message that carried the fix, for spotting gaps |
+| `receivedAt` | N | when IoT Core received the message |
 
 - "Track for device X between A and B" is a single `Query` on `deviceId = X AND ts BETWEEN A AND B`.
 - **Idempotent**: QoS 1 redeliveries and re-sent backlogs overwrite the same `(deviceId, ts)` item.
 
-**Devices**: one item per tracker (`deviceId` partition key) with `lastSeenAt`, `lastFix`, `lastFixTs`,
-`bat`, `rssi`, `fw`, `uptime`, `lastEvent`, `lastEventAt`. `lastFix` is updated with a condition
-`lastFixTs < :new`, so a late-arriving backlog never moves the "current position" backwards.
+**Devices**: one item per tracker (`deviceId` partition key) holding its latest state.
+IoT Core invokes the Lambda asynchronously, so messages can be processed out of order and retries can arrive late.
+To stop older data overwriting newer data, fields are updated in groups. Each group has its own version attribute and is
+written only if `version < :new`:
+
+| Group | Attributes | Version attribute | Ordered by |
+|---|---|---|---|
+| Connectivity | — | `lastSeenAt` | IoT Core receive time |
+| Health | `batV`, `rssi` | `healthAt` | device time (only messages that carry them) |
+| Event | `lastEvent`, `fw`, `uptime` | `lastEventAt` | device time |
+| Position | `lastFix` | `lastFixTs` | fix time, so a late backlog never moves the position backwards |
+
+Separate groups keep a message that's stale for one group (e.g. battery) from being dropped for another it's newest
+for (e.g. its `boot` event). Measurements are ordered by device time, when they were true; `lastSeenAt` tracks
+connectivity, so it uses the receive time.
+
+**DeviceHistory**: the device's status and health timeline, kept forever (no TTL). `Devices` only holds the latest values;
+this table keeps every one, for battery curves and past events.
+
+| Attribute | Type | Notes |
+|---|---|---|
+| `deviceId` | S, partition key | thing name |
+| `receivedAt` | N, sort key | when IoT Core received the message (unique per device, unlike device time) |
+| `ts` | N | device time the message was created |
+| `type` | S | `status` (every status message) or `telemetry` (telemetry messages that report `batV`/`rssi`) |
+| `event`, `fw`, `uptime` | S / S / N | status messages only |
+| `batV`, `rssi` | N | when reported |
+| `seq` | N | telemetry only |
+
+- "Battery over the last week" is one `Query` on `deviceId = X AND receivedAt > :weekAgo`; plot it against `ts`.
+- Lambda retries rewrite the same row. An MQTT QoS 1 redelivery gets a new receive time, so in rare cases a message appears twice.
 
 ### 7. Device provisioning by script, not CDK
 
@@ -179,10 +211,12 @@ The backend takes `deviceId` from the topic, so it's never part of the payload.
 
 ### Common rules
 
-- UTF-8 JSON object; every message has `"v": 1`. Messages with another version are rejected.
+- UTF-8 JSON object. Every message has `"v": 1` and `ts`; a message missing either is rejected.
 - Unknown fields are ignored, so new optional fields can be added to v1 without breaking older backends.
   A breaking change means a new `v`.
-- Time is UTC epoch **seconds** taken from GPS, so the device needs no NTP. IoT Core adds its own receive timestamp.
+- **Timestamps are UTC epoch milliseconds.** `ts` is the device's clock: GPS time, or network time from the
+  modem (`AT+CCLK`) before the first fix. A timestamp before 2020 or more than 5 minutes in the future is treated as
+  "clock not set". IoT Core adds its own `receivedAt`.
 - Optional fields are left out rather than sent as `null`.
 
 ### `telemetry`
@@ -190,32 +224,34 @@ The backend takes `deviceId` from the topic, so it's never part of the payload.
 ```json
 {
   "v": 1,
+  "ts": 1760950001000,
   "seq": 1042,
   "fixes": [
-    {"t": 1760949990, "lat": -32.928312, "lon": 151.781705, "alt": 12.3, "spd": 4.2, "crs": 270.0, "sat": 9, "hdop": 0.9},
-    {"t": 1760950000, "lat": -32.928401, "lon": 151.781822}
+    {"ts": 1760949990000, "lat": -32.928312, "lon": 151.781705, "alt": 12.3, "spd": 4.2, "crs": 270.0, "sat": 9, "hdop": 0.9},
+    {"ts": 1760950000000, "lat": -32.928401, "lon": 151.781822}
   ],
-  "bat": 3.98,
+  "batV": 3.98,
   "rssi": -71
 }
 ```
 
 | Field | Req | Type | Meaning |
 |---|---|---|---|
+| `ts` | yes | int | When the message was created (and `batV`/`rssi` measured) |
 | `seq` | no | int | Message counter, increments per publish, wraps / resets on boot |
 | `fixes` | yes | array, 1–100 | Oldest first |
-| `fixes[].t` | yes | int | Fix time, UTC epoch seconds |
+| `fixes[].ts` | yes | int | Fix time |
 | `fixes[].lat`, `lon` | yes | number | WGS84 decimal degrees, 6 decimals (~0.1 m) is plenty |
 | `fixes[].alt` | no | number | Metres above mean sea level |
 | `fixes[].spd` | no | number | Ground speed, km/h |
 | `fixes[].crs` | no | number | Course over ground, degrees 0–360 |
 | `fixes[].sat` | no | int | Satellites used in the fix |
-| `fixes[].hdop` | no | number | Horizontal dilution of precision |
-| `bat` | no | number | Battery voltage, volts |
-| `rssi` | no | number | Cellular signal, dBm |
+| `fixes[].hdop` | no | number | Horizontal dilution of precision (lower is better; roughly × 3–5 m of error) |
+| `batV` | no | number | Battery voltage, volts |
+| `rssi` | no | number | Cellular signal strength, dBm |
 
 The backend drops individual fixes that are implausible:
-- `t` before 2020 or more than 5 minutes in the future
+- `ts` missing, before 2020 or more than 5 minutes in the future
 - latitude or longitude out of range
 - exactly `0,0` (what many receivers report before they have a fix)
 - wrong types
@@ -225,22 +261,23 @@ The rest of the message is still stored.
 ### `status`
 
 ```json
-{"v": 1, "ev": "boot", "fw": "0.1.0", "bat": 4.12, "rssi": -69, "up": 4}
+{"v": 1, "ts": 1760950001000, "event": "boot", "fw": "0.1.0", "batV": 4.12, "rssi": -69, "uptime": 4}
 ```
 
 | Field | Req | Type | Meaning |
 |---|---|---|---|
-| `ev` | yes | string | `boot`, `heartbeat`, `low_battery`, `shutdown` |
+| `ts` | yes | int | When the event happened |
+| `event` | yes | string | `boot`, `heartbeat`, `low_battery`, `shutdown` |
 | `fw` | no | string | Firmware version |
-| `bat`, `rssi` | no | number | As in telemetry |
-| `up` | no | int | Seconds since boot |
+| `batV`, `rssi` | no | number | As in telemetry |
+| `uptime` | no | int | Seconds since boot |
 
 ### `cmd` (reserved)
 
 Planned shape, so the firmware can subscribe early and ignore what it doesn't understand:
 
 ```json
-{"v": 1, "id": "c0ffee01", "cmd": "set_interval", "args": {"sample_s": 10, "publish_s": 60}}
+{"v": 1, "commandId": "c0ffee01", "command": "set_interval", "arguments": {"sampleIntervalSeconds": 10, "publishIntervalSeconds": 60}}
 ```
 
 ### Recommended device behaviour
@@ -248,5 +285,5 @@ Planned shape, so the firmware can subscribe early and ignore what it doesn't un
 - Sample GPS every 10 s while moving and publish a batch every 60 s. While stationary, send a `heartbeat` status every 15 minutes instead of telemetry.
 - Publish a `boot` status as soon as the connection comes up.
 - **Store-and-forward**: buffer unsent fixes in RAM/PSRAM while offline, then send the backlog oldest first, up to 100 fixes per
-  message, after reconnecting. Resending is safe: storage is keyed on `(deviceId, t)`.
+  message, after reconnecting. Resending is safe: storage is keyed on `(deviceId, ts)`.
 - Treat a message as delivered only after its PUBACK.

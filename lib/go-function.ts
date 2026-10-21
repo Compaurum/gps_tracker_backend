@@ -6,24 +6,24 @@ import { Construct } from 'constructs';
 
 /** Root of the Go module that holds all Lambda handlers. */
 const GO_MODULE_DIR = path.join(__dirname, '..', 'lambda');
-const GO_IMAGE = 'golang:1.26';
+const GO_IMAGE = 'golang:1.26-alpine';
 
 export interface GoFunctionProps extends Omit<lambda.FunctionProps, 'code' | 'handler' | 'runtime' | 'architecture'> {
-  /** Package under lambda/cmd/ to build, e.g. "ingest". */
-  readonly cmd: string;
+  /** Folder under lambda/ holding the function's main package, e.g. "ingest". */
+  readonly name: string;
 }
 
 /**
- * A Lambda built from lambda/cmd/<cmd> as a static arm64 binary on the provided.al2023 runtime.
+ * A Lambda built from lambda/<name> as a static arm64 binary on the provided.al2023 runtime.
  * Builds with the local Go toolchain when available, otherwise inside a golang Docker image.
  */
 export class GoFunction extends lambda.Function {
   constructor(scope: Construct, id: string, props: GoFunctionProps) {
-    const { cmd, ...rest } = props;
+    const { name, ...rest } = props;
     const env = { CGO_ENABLED: '0', GOOS: 'linux', GOARCH: 'arm64' };
     const buildArgs = (outDir: string) => [
       'build', '-tags', 'lambda.norpc', '-trimpath', '-ldflags', '-s -w',
-      '-o', path.posix.join(outDir, 'bootstrap'), `./cmd/${cmd}`,
+      '-o', path.posix.join(outDir, 'bootstrap'), `./${name}`,
     ];
 
     super(scope, id, {

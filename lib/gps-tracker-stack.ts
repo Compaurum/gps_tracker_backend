@@ -11,23 +11,17 @@ import { GoFunction } from './go-function';
 export const TOPIC_ROOT = 'trackers';
 export const DEVICE_POLICY_NAME = 'GpsTrackerDevicePolicy';
 
-export interface GpsTrackerStackProps extends StackProps {
-  /** How long raw positions are kept before DynamoDB TTL deletes them. */
-  retentionDays?: number;
-}
-
 export class GpsTrackerStack extends Stack {
-  constructor(scope: Construct, id: string, props: GpsTrackerStackProps = {}) {
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
 
     // --- Storage -----------------------------------------------------------
 
-    // Position history: one item per GPS fix.
+    // Position history: one item per GPS fix, kept forever (no TTL).
     const positions = new dynamodb.TableV2(this, 'Positions', {
       partitionKey: { name: 'deviceId', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'ts', type: dynamodb.AttributeType.NUMBER },
       billing: dynamodb.Billing.onDemand(),
-      timeToLiveAttribute: 'expiresAt',
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       removalPolicy: RemovalPolicy.RETAIN,
     });
@@ -35,6 +29,16 @@ export class GpsTrackerStack extends Stack {
     // Current state per device: last fix, last seen, battery, firmware, ...
     const devices = new dynamodb.TableV2(this, 'Devices', {
       partitionKey: { name: 'deviceId', type: dynamodb.AttributeType.STRING },
+      billing: dynamodb.Billing.onDemand(),
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+
+    // Status and health history: one item per status message, and per telemetry message that
+    // reports battery or signal. Kept forever (no TTL).
+    const history = new dynamodb.TableV2(this, 'DeviceHistory', {
+      partitionKey: { name: 'deviceId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'receivedAt', type: dynamodb.AttributeType.NUMBER },
       billing: dynamodb.Billing.onDemand(),
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
       removalPolicy: RemovalPolicy.RETAIN,
@@ -49,24 +53,25 @@ export class GpsTrackerStack extends Stack {
     // --- Ingest Lambda -----------------------------------------------------
 
     const ingest = new GoFunction(this, 'Ingest', {
-      cmd: 'ingest',
+      name: 'ingest',
       memorySize: 128,
       timeout: Duration.seconds(10),
       environment: {
         POSITIONS_TABLE: positions.tableName,
         DEVICES_TABLE: devices.tableName,
-        RETENTION_DAYS: String(props.retentionDays ?? 365),
+        HISTORY_TABLE: history.tableName,
       },
       // IoT invokes asynchronously: Lambda retries failures twice, then hands the event to the DLQ.
       retryAttempts: 2,
       onFailure: new destinations.SqsDestination(dlq),
       logGroup: new logs.LogGroup(this, 'IngestLogs', {
-        retention: logs.RetentionDays.ONE_MONTH,
+        retention: logs.RetentionDays.ONE_YEAR,
         removalPolicy: RemovalPolicy.DESTROY,
       }),
     });
     positions.grantWriteData(ingest);
     devices.grantReadWriteData(ingest);
+    history.grantWriteData(ingest);
 
     // --- IoT Core ----------------------------------------------------------
 
@@ -136,6 +141,7 @@ export class GpsTrackerStack extends Stack {
     new CfnOutput(this, 'DevicePolicyName', { value: DEVICE_POLICY_NAME });
     new CfnOutput(this, 'PositionsTableName', { value: positions.tableName });
     new CfnOutput(this, 'DevicesTableName', { value: devices.tableName });
+    new CfnOutput(this, 'DeviceHistoryTableName', { value: history.tableName });
     new CfnOutput(this, 'IngestDlqUrl', { value: dlq.queueUrl });
   }
 }
